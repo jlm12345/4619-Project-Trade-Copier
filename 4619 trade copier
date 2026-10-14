@@ -1,0 +1,2615 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.Linq;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
+using System.Windows.Threading;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Tools;
+#endregion
+
+namespace NinjaTrader.NinjaScript.AddOns
+{
+    public class Project4619TradeCopier : AddOnBase
+    {
+        private NTMenuItem parentMenuItem;
+        private NTMenuItem projectMenuItem;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Description = "4619 Project Trade Copier";
+                Name        = "Project4619TradeCopier";
+            }
+        }
+
+        protected override void OnWindowCreated(Window window)
+        {
+            ControlCenter controlCenter = window as ControlCenter;
+
+            if (controlCenter == null)
+                return;
+
+            parentMenuItem =
+                controlCenter.FindFirst("ControlCenterMenuItemNew")
+                as NTMenuItem;
+
+            if (parentMenuItem == null)
+                return;
+
+            projectMenuItem =
+                new NTMenuItem
+                {
+                    Header =
+                        "4619 Project Trade Copier",
+
+                    Style =
+                        Application.Current.TryFindResource(
+                            "MainMenuItem")
+                        as Style
+                };
+
+            projectMenuItem.Click +=
+                OnMenuItemClick;
+
+            parentMenuItem.Items.Add(
+                projectMenuItem);
+        }
+
+        protected override void OnWindowDestroyed(
+            Window window)
+        {
+            ControlCenter controlCenter =
+                window as ControlCenter;
+
+            if (controlCenter == null)
+                return;
+
+            if (projectMenuItem != null)
+            {
+                projectMenuItem.Click -=
+                    OnMenuItemClick;
+
+                if (
+                    parentMenuItem != null
+                    &&
+                    parentMenuItem.Items.Contains(
+                        projectMenuItem))
+                {
+                    parentMenuItem.Items.Remove(
+                        projectMenuItem);
+                }
+            }
+
+            projectMenuItem = null;
+            parentMenuItem  = null;
+        }
+
+        private void OnMenuItemClick(
+            object sender,
+            RoutedEventArgs e)
+        {
+            Core.Globals.RandomDispatcher.InvokeAsync(
+                new Action(() =>
+                {
+                    Project4619TradeCopierWindow window =
+                        new Project4619TradeCopierWindow();
+
+                    window.Show();
+                }));
+        }
+    }
+
+    public class Project4619TradeCopierWindow : NTWindow
+    {
+        private readonly Brush accentBrush =
+            new SolidColorBrush(
+                Color.FromRgb(
+                    0x14,
+                    0x47,
+                    0xFF));
+
+        private readonly Brush panelBrush =
+            new SolidColorBrush(
+                Color.FromRgb(
+                    0x10,
+                    0x14,
+                    0x1D));
+
+        private readonly Brush rowBrush =
+            new SolidColorBrush(
+                Color.FromRgb(
+                    0x15,
+                    0x1A,
+                    0x25));
+
+        private ComboBox leaderComboBox;
+        private StackPanel followersPanel;
+        private TextBox logTextBox;
+        private TextBlock statusText;
+
+        private TextBlock latencyLastText;
+        private TextBlock latencyAvgText;
+        private TextBlock latencyMaxText;
+        private TextBlock latencyFillsText;
+
+        private Button startButton;
+        private Button stopButton;
+        private Button flattenButton;
+
+        private long latencyFillCount;
+        private double latencyLastMs;
+        private double latencyTotalMs;
+        private double latencyMaxMs;
+
+        private DispatcherTimer killTimer;
+        private List<Account> killAccounts =
+            new List<Account>();
+
+        private List<Account> accounts =
+            new List<Account>();
+
+        private Account leaderAccount;
+
+        private bool copierRunning;
+
+        private class FollowerSetting
+        {
+            public Account Account;
+            public CheckBox CopyCheckBox;
+            public TextBox MultiplierTextBox;
+        }
+
+        private readonly Dictionary<string, FollowerSetting>
+            followerSettings =
+                new Dictionary<string, FollowerSetting>();
+
+        private class FollowerOrderRecord
+        {
+            public Account Account;
+            public Order Order;
+            public Order LeaderOrder;
+
+            public int LastLeaderQuantity;
+            public double LastLeaderLimit;
+            public double LastLeaderStop;
+            public int MatchedLeaderExecutionCount;
+
+            public Queue<long> PendingFollowerExecutionTicks =
+                new Queue<long>();
+        }
+
+        private class LeaderExecutionTracker
+        {
+            public List<long> LeaderExecutionTicks =
+                new List<long>();
+
+            public List<FollowerOrderRecord> Followers =
+                new List<FollowerOrderRecord>();
+        }
+
+        private readonly Dictionary<Order, List<FollowerOrderRecord>>
+            copiedOrders =
+                new Dictionary<Order, List<FollowerOrderRecord>>();
+
+        private readonly Dictionary<string, string>
+            followerOcoMap =
+                new Dictionary<string, string>();
+
+        private readonly Dictionary<Order, FollowerOrderRecord>
+            followerOrderLookup =
+                new Dictionary<Order, FollowerOrderRecord>();
+
+        private readonly Dictionary<Order, LeaderExecutionTracker>
+            executionTrackers =
+                new Dictionary<Order, LeaderExecutionTracker>();
+
+        private readonly object syncLock =
+            new object();
+
+        public Project4619TradeCopierWindow()
+        {
+            Caption =
+                "4619 PROJECT TRADE COPIER";
+
+            Width  = 760;
+            Height = 720;
+
+            MinWidth  = 690;
+            MinHeight = 600;
+
+            WindowStartupLocation =
+                WindowStartupLocation.CenterScreen;
+
+            Background =
+                panelBrush;
+
+            Content =
+                BuildLayout();
+
+            Loaded += delegate
+            {
+                RefreshAccounts();
+            };
+
+            Closed += delegate
+            {
+                StopCopier();
+            };
+        }
+
+        private UIElement BuildLayout()
+        {
+            Grid root =
+                new Grid
+                {
+                    Background =
+                        panelBrush,
+
+                    Margin =
+                        new Thickness(14)
+                };
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        GridLength.Auto
+                });
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        GridLength.Auto
+                });
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        GridLength.Auto
+                });
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        new GridLength(
+                            1,
+                            GridUnitType.Star)
+                });
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        GridLength.Auto
+                });
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        GridLength.Auto
+                });
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        GridLength.Auto
+                });
+
+            root.RowDefinitions.Add(
+                new RowDefinition
+                {
+                    Height =
+                        new GridLength(175)
+                });
+
+            TextBlock projectTitle =
+                new TextBlock
+                {
+                    Text =
+                        "4619 PROJECT TRADE COPIER",
+
+                    Foreground =
+                        accentBrush,
+
+                    FontSize =
+                        20,
+
+                    FontWeight =
+                        FontWeights.Bold,
+
+                    HorizontalAlignment =
+                        HorizontalAlignment.Right,
+
+                    Margin =
+                        new Thickness(
+                            0,
+                            0,
+                            4,
+                            10)
+                };
+
+            Grid.SetRow(
+                projectTitle,
+                0);
+
+            root.Children.Add(
+                projectTitle);
+
+            Border leaderBorder =
+                AccentBorder();
+
+            leaderBorder.Margin =
+                new Thickness(
+                    0,
+                    0,
+                    0,
+                    12);
+
+            Grid leaderGrid =
+                new Grid
+                {
+                    Margin =
+                        new Thickness(
+                            12,
+                            8,
+                            12,
+                            8)
+                };
+
+            leaderGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(165)
+                });
+
+            leaderGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(
+                            1,
+                            GridUnitType.Star)
+                });
+
+            leaderGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(120)
+                });
+
+            TextBlock leaderLabel =
+                Label(
+                    "MASTER ACCOUNT",
+                    16,
+                    FontWeights.Bold);
+
+            Grid.SetColumn(
+                leaderLabel,
+                0);
+
+            leaderGrid.Children.Add(
+                leaderLabel);
+
+            leaderComboBox =
+                new ComboBox
+                {
+                    Height =
+                        32,
+
+                    Margin =
+                        new Thickness(
+                            8,
+                            0,
+                            12,
+                            0),
+
+                    VerticalContentAlignment =
+                        VerticalAlignment.Center,
+
+                    FontSize =
+                        15
+                };
+
+            leaderComboBox.SelectionChanged +=
+                LeaderComboBox_SelectionChanged;
+
+            Grid.SetColumn(
+                leaderComboBox,
+                1);
+
+            leaderGrid.Children.Add(
+                leaderComboBox);
+
+            Button refreshButton =
+                AccentButton(
+                    "REVITALIZE");
+
+            refreshButton.Click +=
+                delegate
+                {
+                    if (copierRunning)
+                    {
+                        Log(
+                            "Stop copier before refreshing accounts.");
+
+                        return;
+                    }
+
+                    RefreshAccounts();
+                };
+
+            Grid.SetColumn(
+                refreshButton,
+                2);
+
+            leaderGrid.Children.Add(
+                refreshButton);
+
+            leaderBorder.Child =
+                leaderGrid;
+
+            Grid.SetRow(
+                leaderBorder,
+                1);
+
+            root.Children.Add(
+                leaderBorder);
+            Border headerBorder =
+                AccentBorder();
+
+            Grid headerGrid =
+                new Grid
+                {
+                    Margin =
+                        new Thickness(
+                            8,
+                            5,
+                            8,
+                            5)
+                };
+
+            headerGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(90)
+                });
+
+            headerGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(
+                            1,
+                            GridUnitType.Star)
+                });
+
+            headerGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(160)
+                });
+
+            TextBlock copyHeader =
+                Label(
+                    "COPY",
+                    14,
+                    FontWeights.Bold);
+
+            TextBlock acctHeader =
+                Label(
+                    "SLAVE ACCOUNT",
+                    14,
+                    FontWeights.Bold);
+
+            TextBlock qtyHeader =
+                Label(
+                    "HOW MANY\nCONTRACTS YOU WANT?",
+                    12,
+                    FontWeights.Bold);
+
+            qtyHeader.TextAlignment =
+                TextAlignment.Center;
+
+            qtyHeader.HorizontalAlignment =
+                HorizontalAlignment.Center;
+
+            Grid.SetColumn(
+                copyHeader,
+                0);
+
+            Grid.SetColumn(
+                acctHeader,
+                1);
+
+            Grid.SetColumn(
+                qtyHeader,
+                2);
+
+            headerGrid.Children.Add(
+                copyHeader);
+
+            headerGrid.Children.Add(
+                acctHeader);
+
+            headerGrid.Children.Add(
+                qtyHeader);
+
+            headerBorder.Child =
+                headerGrid;
+
+            Grid.SetRow(
+                headerBorder,
+                2);
+
+            root.Children.Add(
+                headerBorder);
+
+            Border followerBorder =
+                AccentBorder();
+
+            followerBorder.Margin =
+                new Thickness(
+                    0,
+                    8,
+                    0,
+                    12);
+
+            ScrollViewer followerScroll =
+                new ScrollViewer
+                {
+                    VerticalScrollBarVisibility =
+                        ScrollBarVisibility.Auto,
+
+                    HorizontalScrollBarVisibility =
+                        ScrollBarVisibility.Disabled,
+
+                    Margin =
+                        new Thickness(6)
+                };
+
+            followersPanel =
+                new StackPanel();
+
+            followerScroll.Content =
+                followersPanel;
+
+            followerBorder.Child =
+                followerScroll;
+
+            Grid.SetRow(
+                followerBorder,
+                3);
+
+            root.Children.Add(
+                followerBorder);
+
+            Grid buttonGrid =
+                new Grid
+                {
+                    Margin =
+                        new Thickness(
+                            0,
+                            0,
+                            0,
+                            8)
+                };
+
+            buttonGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(
+                            1,
+                            GridUnitType.Star)
+                });
+
+            buttonGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(12)
+                });
+
+            buttonGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(
+                            1,
+                            GridUnitType.Star)
+                });
+
+            buttonGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(12)
+                });
+
+            buttonGrid.ColumnDefinitions.Add(
+                new ColumnDefinition
+                {
+                    Width =
+                        new GridLength(
+                            1,
+                            GridUnitType.Star)
+                });
+
+            startButton =
+                AccentButton(
+                    "");
+
+            startButton.Content =
+                new TextBlock
+                {
+                    Text =
+                        "START\nLET'S GET THAT MONEY!",
+
+                    TextAlignment =
+                        TextAlignment.Center,
+
+                    HorizontalAlignment =
+                        HorizontalAlignment.Center
+                };
+
+            startButton.Height =
+                46;
+
+            startButton.HorizontalContentAlignment =
+                HorizontalAlignment.Center;
+
+            startButton.VerticalContentAlignment =
+                VerticalAlignment.Center;
+
+            startButton.Click +=
+                StartButton_Click;
+
+            Grid.SetColumn(
+                startButton,
+                0);
+
+            buttonGrid.Children.Add(
+                startButton);
+
+            stopButton =
+                AccentButton(
+                    "STOP COPIER");
+
+            stopButton.IsEnabled =
+                false;
+
+            stopButton.Click +=
+                StopButton_Click;
+
+            Grid.SetColumn(
+                stopButton,
+                2);
+
+            buttonGrid.Children.Add(
+                stopButton);
+
+            flattenButton =
+                AccentButton(
+                    "KILL 'EM ALL");
+
+            flattenButton.Click +=
+                FlattenButton_Click;
+
+            Grid.SetColumn(
+                flattenButton,
+                4);
+
+            buttonGrid.Children.Add(
+                flattenButton);
+
+            Grid.SetRow(
+                buttonGrid,
+                4);
+
+            root.Children.Add(
+                buttonGrid);
+
+            StackPanel statusPanel =
+                new StackPanel
+                {
+                    HorizontalAlignment =
+                        HorizontalAlignment.Center,
+
+                    Margin =
+                        new Thickness(
+                            0,
+                            0,
+                            0,
+                            10)
+                };
+
+            statusText =
+                new TextBlock
+                {
+                    Text =
+                        "LOITERING...",
+
+                    Foreground =
+                        accentBrush,
+
+                    FontSize =
+                        18,
+
+                    FontWeight =
+                        FontWeights.Bold,
+
+                    HorizontalAlignment =
+                        HorizontalAlignment.Center
+                };
+
+            statusPanel.Children.Add(
+                statusText);
+
+            Grid.SetRow(
+                statusPanel,
+                5);
+
+            root.Children.Add(
+                statusPanel);
+
+            Border latencyBorder =
+                AccentBorder();
+
+            latencyBorder.Margin =
+                new Thickness(
+                    0,
+                    0,
+                    0,
+                    10);
+
+            Grid latencyGrid =
+                new Grid
+                {
+                    Margin =
+                        new Thickness(
+                            8,
+                            6,
+                            8,
+                            6)
+                };
+
+            for (int i = 0; i < 4; i++)
+            {
+                latencyGrid.ColumnDefinitions.Add(
+                    new ColumnDefinition
+                    {
+                        Width =
+                            new GridLength(
+                                1,
+                                GridUnitType.Star)
+                    });
+            }
+
+            latencyLastText =
+                Label(
+                    "LAST: --",
+                    14,
+                    FontWeights.Bold);
+
+            latencyAvgText =
+                Label(
+                    "AVG: --",
+                    14,
+                    FontWeights.Bold);
+
+            latencyMaxText =
+                Label(
+                    "MAX: --",
+                    14,
+                    FontWeights.Bold);
+
+            latencyFillsText =
+                Label(
+                    "FILLS: 0",
+                    14,
+                    FontWeights.Bold);
+
+            latencyLastText.HorizontalAlignment =
+                HorizontalAlignment.Center;
+
+            latencyAvgText.HorizontalAlignment =
+                HorizontalAlignment.Center;
+
+            latencyMaxText.HorizontalAlignment =
+                HorizontalAlignment.Center;
+
+            latencyFillsText.HorizontalAlignment =
+                HorizontalAlignment.Center;
+
+            Grid.SetColumn(
+                latencyLastText,
+                0);
+
+            Grid.SetColumn(
+                latencyAvgText,
+                1);
+
+            Grid.SetColumn(
+                latencyMaxText,
+                2);
+
+            Grid.SetColumn(
+                latencyFillsText,
+                3);
+
+            latencyGrid.Children.Add(
+                latencyLastText);
+
+            latencyGrid.Children.Add(
+                latencyAvgText);
+
+            latencyGrid.Children.Add(
+                latencyMaxText);
+
+            latencyGrid.Children.Add(
+                latencyFillsText);
+
+            latencyBorder.Child =
+                latencyGrid;
+
+            Grid.SetRow(
+                latencyBorder,
+                6);
+
+            root.Children.Add(
+                latencyBorder);
+
+            Border logBorder =
+                AccentBorder();
+
+            logTextBox =
+                new TextBox
+                {
+                    IsReadOnly =
+                        true,
+
+                    AcceptsReturn =
+                        true,
+
+                    TextWrapping =
+                        TextWrapping.Wrap,
+
+                    VerticalScrollBarVisibility =
+                        ScrollBarVisibility.Auto,
+
+                    Background =
+                        rowBrush,
+
+                    Foreground =
+                        accentBrush,
+
+                    BorderThickness =
+                        new Thickness(0),
+
+                    FontFamily =
+                        new FontFamily(
+                            "Sans Droid"),
+
+                    FontSize =
+                        11,
+
+                    Padding =
+                        new Thickness(8)
+                };
+
+            logBorder.Child =
+                logTextBox;
+
+            Grid.SetRow(
+                logBorder,
+                7);
+
+            root.Children.Add(
+                logBorder);
+
+            return root;
+        }
+
+        private void RefreshAccounts()
+        {
+            try
+            {
+                List<Account> snapshot;
+
+                lock (Account.All)
+                {
+                    snapshot =
+                        Account.All
+                            .Where(
+                                a =>
+                                    a != null)
+                            .OrderBy(
+                                a => a.Name)
+                            .ToList();
+                }
+
+                accounts =
+                    snapshot;
+
+                string previousLeader =
+                    leaderComboBox.SelectedItem
+                    as string;
+
+                leaderComboBox.ItemsSource =
+                    null;
+
+                leaderComboBox.ItemsSource =
+                    accounts
+                        .Select(
+                            a => a.Name)
+                        .ToList();
+
+                string leaderToSelect =
+                    null;
+
+                Account sim101 =
+                    accounts.FirstOrDefault(
+                        a =>
+                            string.Equals(
+                                a.Name,
+                                "Sim101",
+                                StringComparison.OrdinalIgnoreCase));
+
+                if (sim101 != null)
+                {
+                    leaderToSelect =
+                        sim101.Name;
+                }
+
+                else if (
+                    !string.IsNullOrEmpty(
+                        previousLeader)
+                    &&
+                    accounts.Any(
+                        a =>
+                            a.Name ==
+                            previousLeader))
+                {
+                    leaderToSelect =
+                        previousLeader;
+                }
+
+                else if (
+                    accounts.Count > 0)
+                {
+                    leaderToSelect =
+                        accounts[0].Name;
+                }
+
+                leaderComboBox.SelectedItem =
+                    leaderToSelect;
+
+                RebuildFollowerRows();
+
+                Log(
+                    "Accounts refreshed. Found "
+                    +
+                    accounts.Count
+                    +
+                    " account(s).");
+
+                if (
+                    !string.IsNullOrEmpty(
+                        leaderToSelect))
+                {
+                    Log(
+                        "Leader selected: "
+                        +
+                        leaderToSelect);
+                }
+            }
+
+            catch (Exception ex)
+            {
+                Log(
+                    "REFRESH ERROR: "
+                    +
+                    ex.Message);
+            }
+        }
+
+        private void LeaderComboBox_SelectionChanged(
+            object sender,
+            SelectionChangedEventArgs e)
+        {
+            if (copierRunning)
+                return;
+
+            RebuildFollowerRows();
+        }
+
+        private void RebuildFollowerRows()
+        {
+            if (
+                followersPanel == null
+                ||
+                leaderComboBox == null)
+            {
+                return;
+            }
+
+            followersPanel.Children.Clear();
+            followerSettings.Clear();
+
+            string leaderName =
+                leaderComboBox.SelectedItem
+                as string;
+
+            foreach (
+                Account account
+                in accounts)
+            {
+                if (
+                    account == null
+                    ||
+                    account.Name ==
+                    leaderName)
+                {
+                    continue;
+                }
+
+                Border rowBorder =
+                    new Border
+                    {
+                        BorderBrush =
+                            new SolidColorBrush(
+                                Color.FromRgb(
+                                    0x28,
+                                    0x31,
+                                    0x45)),
+
+                        BorderThickness =
+                            new Thickness(
+                                0,
+                                0,
+                                0,
+                                1),
+
+                        Background =
+                            rowBrush,
+
+                        Padding =
+                            new Thickness(
+                                8,
+                                7,
+                                8,
+                                7)
+                    };
+
+                Grid row =
+                    new Grid();
+
+                row.ColumnDefinitions.Add(
+                    new ColumnDefinition
+                    {
+                        Width =
+                            new GridLength(90)
+                    });
+
+                row.ColumnDefinitions.Add(
+                    new ColumnDefinition
+                    {
+                        Width =
+                            new GridLength(
+                                1,
+                                GridUnitType.Star)
+                    });
+
+                row.ColumnDefinitions.Add(
+                    new ColumnDefinition
+                    {
+                        Width =
+                            new GridLength(160)
+                    });
+
+                CheckBox copyCheckBox =
+                    new CheckBox
+                    {
+                        IsChecked =
+                            false,
+
+                        HorizontalAlignment =
+                            HorizontalAlignment.Center,
+
+                        VerticalAlignment =
+                            VerticalAlignment.Center
+                    };
+
+                Grid.SetColumn(
+                    copyCheckBox,
+                    0);
+
+                row.Children.Add(
+                    copyCheckBox);
+
+                TextBlock accountName =
+                    Label(
+                        account.Name,
+                        14,
+                        FontWeights.SemiBold);
+
+                Grid.SetColumn(
+                    accountName,
+                    1);
+
+                row.Children.Add(
+                    accountName);
+
+                TextBox multiplier =
+                    new TextBox
+                    {
+                        Text =
+                            "1",
+
+                        Width =
+                            80,
+
+                        Height =
+                            28,
+
+                        HorizontalAlignment =
+                            HorizontalAlignment.Center,
+
+                        VerticalContentAlignment =
+                            VerticalAlignment.Center,
+
+                        TextAlignment =
+                            TextAlignment.Center,
+
+                        FontSize =
+                            14
+                    };
+
+                Grid.SetColumn(
+                    multiplier,
+                    2);
+
+                row.Children.Add(
+                    multiplier);
+
+                rowBorder.Child =
+                    row;
+
+                followersPanel.Children.Add(
+                    rowBorder);
+
+                followerSettings[
+                    account.Name] =
+                        new FollowerSetting
+                        {
+                            Account =
+                                account,
+
+                            CopyCheckBox =
+                                copyCheckBox,
+
+                            MultiplierTextBox =
+                                multiplier
+                        };
+            }
+
+            if (
+                followersPanel.Children.Count
+                == 0)
+            {
+                TextBlock none =
+                    Label(
+                        "NO SLAVE ACCOUNTS AVAILABLE.",
+                        14,
+                        FontWeights.Normal);
+
+                none.Margin =
+                    new Thickness(10);
+
+                none.HorizontalAlignment =
+                    HorizontalAlignment.Center;
+
+                followersPanel.Children.Add(
+                    none);
+            }
+        }
+        private void StartButton_Click(
+            object sender,
+            RoutedEventArgs e)
+        {
+            StartCopier();
+        }
+
+        private void StartCopier()
+        {
+            if (copierRunning)
+                return;
+
+            string leaderName =
+                leaderComboBox.SelectedItem
+                as string;
+
+            if (string.IsNullOrEmpty(leaderName))
+            {
+                Log(
+                    "START ERROR: No leader account selected.");
+
+                return;
+            }
+
+            leaderAccount =
+                accounts.FirstOrDefault(
+                    a =>
+                        a.Name == leaderName);
+
+            if (leaderAccount == null)
+            {
+                Log(
+                    "START ERROR: Leader account not found.");
+
+                return;
+            }
+
+            List<FollowerSetting> enabledFollowers =
+                GetEnabledFollowers();
+
+            if (enabledFollowers.Count == 0)
+            {
+                Log(
+                    "START ERROR: Select at least one follower.");
+
+                return;
+            }
+
+            foreach (
+                FollowerSetting setting
+                in enabledFollowers)
+            {
+                int multiplier;
+
+                if (
+                    !int.TryParse(
+                        setting.MultiplierTextBox.Text,
+                        out multiplier)
+                    ||
+                    multiplier < 1)
+                {
+                    Log(
+                        "START ERROR: Invalid multiplier for "
+                        +
+                        setting.Account.Name);
+
+                    return;
+                }
+
+                if (
+                    setting.Account.Connection == null
+                    ||
+                    setting.Account.Connection.Status
+                        != ConnectionStatus.Connected)
+                {
+                    Log(
+                        "START ERROR: Follower not connected: "
+                        +
+                        setting.Account.Name);
+
+                    return;
+                }
+            }
+
+            if (
+                leaderAccount.Connection == null
+                ||
+                leaderAccount.Connection.Status
+                    != ConnectionStatus.Connected)
+            {
+                Log(
+                    "START ERROR: Master account not connected.");
+
+                return;
+            }
+
+            lock (syncLock)
+            {
+                copiedOrders.Clear();
+                followerOcoMap.Clear();
+                followerOrderLookup.Clear();
+                executionTrackers.Clear();
+            }
+
+            ResetLatencyCounters();
+
+            leaderAccount.OrderUpdate -=
+                LeaderAccount_OrderUpdate;
+
+            leaderAccount.OrderUpdate +=
+                LeaderAccount_OrderUpdate;
+
+            leaderAccount.ExecutionUpdate -=
+                LeaderAccount_ExecutionUpdate;
+
+            leaderAccount.ExecutionUpdate +=
+                LeaderAccount_ExecutionUpdate;
+
+            foreach (
+                FollowerSetting setting
+                in enabledFollowers)
+            {
+                setting.Account.ExecutionUpdate -=
+                    FollowerAccount_ExecutionUpdate;
+
+                setting.Account.ExecutionUpdate +=
+                    FollowerAccount_ExecutionUpdate;
+            }
+
+            copierRunning =
+                true;
+
+            leaderComboBox.IsEnabled =
+                false;
+
+            startButton.IsEnabled =
+                false;
+
+            stopButton.IsEnabled =
+                true;
+
+            SetFollowerControlsEnabled(false);
+
+            statusText.Text =
+                "WEALTH BUILDING IN PROCESS...";
+
+            Log(
+                "COPIER STARTED.");
+
+            Log(
+                "Leader: "
+                +
+                leaderAccount.Name);
+
+            foreach (
+                FollowerSetting setting
+                in enabledFollowers)
+            {
+                Log(
+                    "Follower enabled: "
+                    +
+                    setting.Account.Name
+                    +
+                    "  x"
+                    +
+                    setting.MultiplierTextBox.Text);
+            }
+        }
+
+        private void StopButton_Click(
+            object sender,
+            RoutedEventArgs e)
+        {
+            StopCopier();
+        }
+
+        private void StopCopier()
+        {
+            if (killTimer != null)
+            {
+                killTimer.Stop();
+
+                killTimer.Tick -=
+                    KillTimer_Tick;
+
+                killTimer =
+                    null;
+            }
+
+            killAccounts.Clear();
+
+            if (leaderAccount != null)
+            {
+                leaderAccount.OrderUpdate -=
+                    LeaderAccount_OrderUpdate;
+
+                leaderAccount.ExecutionUpdate -=
+                    LeaderAccount_ExecutionUpdate;
+            }
+
+            foreach (
+                FollowerSetting setting
+                in followerSettings.Values)
+            {
+                if (
+                    setting != null
+                    &&
+                    setting.Account != null)
+                {
+                    setting.Account.ExecutionUpdate -=
+                        FollowerAccount_ExecutionUpdate;
+                }
+            }
+
+            lock (syncLock)
+            {
+                copiedOrders.Clear();
+                followerOcoMap.Clear();
+                followerOrderLookup.Clear();
+                executionTrackers.Clear();
+            }
+
+            copierRunning =
+                false;
+
+            leaderComboBox.IsEnabled =
+                true;
+
+            startButton.IsEnabled =
+                true;
+
+            stopButton.IsEnabled =
+                false;
+
+            SetFollowerControlsEnabled(true);
+
+            if (statusText != null)
+            {
+                statusText.Text =
+                    string.Empty;
+            }
+
+            if (logTextBox != null)
+            {
+                Log(
+                    "COPIER STOPPED.");
+            }
+
+            leaderAccount =
+                null;
+        }
+
+        private void LeaderAccount_OrderUpdate(
+            object sender,
+            OrderEventArgs e)
+        {
+            if (
+                !copierRunning
+                ||
+                e == null
+                ||
+                e.Order == null)
+            {
+                return;
+            }
+
+            Order leaderOrder =
+                e.Order;
+
+            if (
+                leaderAccount == null
+                ||
+                leaderOrder.Account != leaderAccount)
+            {
+                return;
+            }
+
+            try
+            {
+                bool alreadyCopied;
+
+                lock (syncLock)
+                {
+                    alreadyCopied =
+                        copiedOrders.ContainsKey(
+                            leaderOrder);
+                }
+
+                if (!alreadyCopied)
+                {
+                    if (
+                        e.OrderState == OrderState.Submitted
+                        ||
+                        e.OrderState == OrderState.Accepted
+                        ||
+                        e.OrderState == OrderState.Working
+                        ||
+                        e.OrderState == OrderState.TriggerPending
+                        ||
+                        e.OrderState == OrderState.PartFilled)
+                    {
+                        CopyNewLeaderOrder(
+                            leaderOrder);
+
+                        return;
+                    }
+                }
+
+                if (!alreadyCopied)
+                    return;
+
+                if (
+                    e.OrderState == OrderState.CancelPending
+                    ||
+                    e.OrderState == OrderState.CancelSubmitted
+                    ||
+                    e.OrderState == OrderState.Cancelled)
+                {
+                    CancelFollowerOrders(
+                        leaderOrder);
+
+                    return;
+                }
+
+                if (
+                    e.OrderState == OrderState.ChangePending
+                    ||
+                    e.OrderState == OrderState.ChangeSubmitted
+                    ||
+                    e.OrderState == OrderState.Working
+                    ||
+                    e.OrderState == OrderState.Accepted)
+                {
+                    ChangeFollowerOrders(
+                        leaderOrder);
+                }
+            }
+
+            catch (Exception ex)
+            {
+                LogThreadSafe(
+                    "ORDER UPDATE ERROR: "
+                    +
+                    ex.Message);
+            }
+        }
+
+        private void CopyNewLeaderOrder(
+            Order leaderOrder)
+        {
+            List<FollowerSetting> followers =
+                GetEnabledFollowersThreadSafe();
+
+            if (followers.Count == 0)
+                return;
+
+            List<FollowerOrderRecord> records =
+                new List<FollowerOrderRecord>();
+
+            LeaderExecutionTracker tracker =
+                new LeaderExecutionTracker();
+
+            lock (syncLock)
+            {
+                if (
+                    !executionTrackers.ContainsKey(
+                        leaderOrder))
+                {
+                    executionTrackers.Add(
+                        leaderOrder,
+                        tracker);
+                }
+                else
+                {
+                    tracker =
+                        executionTrackers[
+                            leaderOrder];
+                }
+            }
+
+            foreach (
+                FollowerSetting follower
+                in followers)
+            {
+                try
+                {
+                    int multiplier =
+                        GetMultiplier(
+                            follower);
+
+                    int followerQuantity =
+                        Math.Max(
+                            1,
+                            leaderOrder.Quantity
+                            *
+                            multiplier);
+
+                    string followerOco =
+                        GetFollowerOco(
+                            follower.Account,
+                            leaderOrder.Oco);
+
+                    string orderName =
+                        "P4619TCII";
+
+                    Order followerOrder =
+                        follower.Account.CreateOrder(
+                            leaderOrder.Instrument,
+                            leaderOrder.OrderAction,
+                            leaderOrder.OrderType,
+                            OrderEntry.Manual,
+                            leaderOrder.TimeInForce,
+                            followerQuantity,
+                            leaderOrder.LimitPrice,
+                            leaderOrder.StopPrice,
+                            followerOco,
+                            orderName,
+                            leaderOrder.Gtd,
+                            null);
+
+                    FollowerOrderRecord record =
+                        new FollowerOrderRecord
+                        {
+                            Account =
+                                follower.Account,
+
+                            Order =
+                                followerOrder,
+
+                            LeaderOrder =
+                                leaderOrder,
+
+                            LastLeaderQuantity =
+                                leaderOrder.Quantity,
+
+                            LastLeaderLimit =
+                                leaderOrder.LimitPrice,
+
+                            LastLeaderStop =
+                                leaderOrder.StopPrice,
+
+                            MatchedLeaderExecutionCount =
+                                0
+                        };
+
+                    lock (syncLock)
+                    {
+                        followerOrderLookup[
+                            followerOrder] =
+                                record;
+
+                        tracker.Followers.Add(
+                            record);
+                    }
+
+                    follower.Account.Submit(
+                        new[]
+                        {
+                            followerOrder
+                        });
+
+                    records.Add(
+                        record);
+
+                    LogThreadSafe(
+                        "COPIED "
+                        +
+                        leaderOrder.OrderAction
+                        +
+                        " "
+                        +
+                        leaderOrder.Quantity
+                        +
+                        " "
+                        +
+                        leaderOrder.Instrument.FullName
+                        +
+                        " -> "
+                        +
+                        follower.Account.Name
+                        +
+                        " qty "
+                        +
+                        followerQuantity);
+                }
+
+                catch (Exception ex)
+                {
+                    LogThreadSafe(
+                        "SUBMIT ERROR "
+                        +
+                        follower.Account.Name
+                        +
+                        ": "
+                        +
+                        ex.Message);
+                }
+            }
+
+            lock (syncLock)
+            {
+                if (
+                    !copiedOrders.ContainsKey(
+                        leaderOrder))
+                {
+                    copiedOrders.Add(
+                        leaderOrder,
+                        records);
+                }
+            }
+        }
+
+        private void LeaderAccount_ExecutionUpdate(
+            object sender,
+            ExecutionEventArgs e)
+        {
+            long leaderTicks =
+                Stopwatch.GetTimestamp();
+
+            if (
+                !copierRunning
+                ||
+                e == null
+                ||
+                e.Execution == null
+                ||
+                e.Execution.Order == null)
+            {
+                return;
+            }
+
+            Order leaderOrder =
+                e.Execution.Order;
+
+            LeaderExecutionTracker tracker;
+
+            lock (syncLock)
+            {
+                if (
+                    !executionTrackers.TryGetValue(
+                        leaderOrder,
+                        out tracker))
+                {
+                    return;
+                }
+
+                tracker.LeaderExecutionTicks.Add(
+                    leaderTicks);
+
+                foreach (
+                    FollowerOrderRecord record
+                    in tracker.Followers.ToList())
+                {
+                    TryMatchPendingFollowerExecution(
+                        tracker,
+                        record);
+                }
+            }
+        }
+
+        private void FollowerAccount_ExecutionUpdate(
+            object sender,
+            ExecutionEventArgs e)
+        {
+            long followerTicks =
+                Stopwatch.GetTimestamp();
+
+            if (
+                !copierRunning
+                ||
+                e == null
+                ||
+                e.Execution == null
+                ||
+                e.Execution.Order == null)
+            {
+                return;
+            }
+
+            Order followerOrder =
+                e.Execution.Order;
+
+            lock (syncLock)
+            {
+                FollowerOrderRecord record;
+
+                if (
+                    !followerOrderLookup.TryGetValue(
+                        followerOrder,
+                        out record)
+                    ||
+                    record == null
+                    ||
+                    record.LeaderOrder == null)
+                {
+                    return;
+                }
+
+                LeaderExecutionTracker tracker;
+
+                if (
+                    !executionTrackers.TryGetValue(
+                        record.LeaderOrder,
+                        out tracker))
+                {
+                    return;
+                }
+
+                if (
+                    record.MatchedLeaderExecutionCount
+                    <
+                    tracker.LeaderExecutionTicks.Count)
+                {
+                    MatchFollowerExecution(
+                        tracker,
+                        record,
+                        followerTicks);
+                }
+                else
+                {
+                    record.PendingFollowerExecutionTicks.Enqueue(
+                        followerTicks);
+                }
+            }
+        }
+        private void TryMatchPendingFollowerExecution(
+            LeaderExecutionTracker tracker,
+            FollowerOrderRecord record)
+        {
+            if (tracker == null || record == null)
+                return;
+
+            while (
+                record.PendingFollowerExecutionTicks.Count > 0
+                &&
+                record.MatchedLeaderExecutionCount <
+                    tracker.LeaderExecutionTicks.Count)
+            {
+                long followerTicks =
+                    record.PendingFollowerExecutionTicks.Dequeue();
+
+                MatchFollowerExecution(
+                    tracker,
+                    record,
+                    followerTicks);
+            }
+        }
+
+        private void MatchFollowerExecution(
+            LeaderExecutionTracker tracker,
+            FollowerOrderRecord record,
+            long followerTicks)
+        {
+            int leaderIndex =
+                record.MatchedLeaderExecutionCount;
+
+            if (
+                leaderIndex < 0
+                ||
+                leaderIndex >= tracker.LeaderExecutionTicks.Count)
+            {
+                return;
+            }
+
+            long leaderTicks =
+                tracker.LeaderExecutionTicks[leaderIndex];
+
+            record.MatchedLeaderExecutionCount++;
+
+            double latencyMs =
+                ((double)(followerTicks - leaderTicks)
+                / Stopwatch.Frequency) * 1000.0;
+
+            RecordLatency(
+                record.Account.Name,
+                latencyMs);
+        }
+
+        private void RecordLatency(
+            string accountName,
+            double latencyMs)
+        {
+            latencyFillCount++;
+
+            latencyLastMs =
+                latencyMs;
+
+            latencyTotalMs +=
+                latencyMs;
+
+            if (latencyMs > latencyMaxMs)
+            {
+                latencyMaxMs =
+                    latencyMs;
+            }
+
+            LogThreadSafe(
+                "LATENCY "
+                + accountName
+                + ": "
+                + latencyMs.ToString("0.000")
+                + " ms");
+
+            UpdateLatencyDisplayThreadSafe();
+        }
+
+        private void ResetLatencyCounters()
+        {
+            latencyFillCount = 0;
+            latencyLastMs = 0.0;
+            latencyTotalMs = 0.0;
+            latencyMaxMs = 0.0;
+
+            UpdateLatencyDisplay();
+        }
+
+        private void UpdateLatencyDisplayThreadSafe()
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                UpdateLatencyDisplay();
+            }
+            else
+            {
+                Dispatcher.BeginInvoke(
+                    new Action(UpdateLatencyDisplay));
+            }
+        }
+
+        private void UpdateLatencyDisplay()
+        {
+            if (
+                latencyLastText == null
+                ||
+                latencyAvgText == null
+                ||
+                latencyMaxText == null
+                ||
+                latencyFillsText == null)
+            {
+                return;
+            }
+
+            if (latencyFillCount <= 0)
+            {
+                latencyLastText.Text =
+                    "LAST: --";
+
+                latencyAvgText.Text =
+                    "AVG: --";
+
+                latencyMaxText.Text =
+                    "MAX: --";
+
+                latencyFillsText.Text =
+                    "FILLS: 0";
+
+                return;
+            }
+
+            latencyLastText.Text =
+                "LAST: "
+                + latencyLastMs.ToString("0.000")
+                + " ms";
+
+            latencyAvgText.Text =
+                "AVG: "
+                + (latencyTotalMs / latencyFillCount)
+                    .ToString("0.000")
+                + " ms";
+
+            latencyMaxText.Text =
+                "MAX: "
+                + latencyMaxMs.ToString("0.000")
+                + " ms";
+
+            latencyFillsText.Text =
+                "FILLS: "
+                + latencyFillCount;
+        }
+
+        private void ChangeFollowerOrders(
+            Order leaderOrder)
+        {
+            List<FollowerOrderRecord> records;
+
+            lock (syncLock)
+            {
+                if (
+                    !copiedOrders.TryGetValue(
+                        leaderOrder,
+                        out records))
+                {
+                    return;
+                }
+
+                records =
+                    records.ToList();
+            }
+
+            foreach (
+                FollowerOrderRecord record
+                in records)
+            {
+                if (
+                    record == null
+                    ||
+                    record.Order == null
+                    ||
+                    record.Account == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (IsTerminal(record.Order.OrderState))
+                        continue;
+
+                    FollowerSetting setting;
+
+                    if (
+                        !followerSettings.TryGetValue(
+                            record.Account.Name,
+                            out setting))
+                    {
+                        continue;
+                    }
+
+                    int multiplier =
+                        GetMultiplier(setting);
+
+                    int desiredQuantity =
+                        Math.Max(
+                            1,
+                            leaderOrder.Quantity * multiplier);
+
+                    bool changed =
+                        false;
+
+                    if (
+                        record.LastLeaderQuantity !=
+                        leaderOrder.Quantity)
+                    {
+                        record.Order.QuantityChanged =
+                            desiredQuantity;
+
+                        record.LastLeaderQuantity =
+                            leaderOrder.Quantity;
+
+                        changed =
+                            true;
+                    }
+
+                    if (
+                        record.LastLeaderLimit !=
+                        leaderOrder.LimitPrice)
+                    {
+                        record.Order.LimitPriceChanged =
+                            leaderOrder.LimitPrice;
+
+                        record.LastLeaderLimit =
+                            leaderOrder.LimitPrice;
+
+                        changed =
+                            true;
+                    }
+
+                    if (
+                        record.LastLeaderStop !=
+                        leaderOrder.StopPrice)
+                    {
+                        record.Order.StopPriceChanged =
+                            leaderOrder.StopPrice;
+
+                        record.LastLeaderStop =
+                            leaderOrder.StopPrice;
+
+                        changed =
+                            true;
+                    }
+
+                    if (changed)
+                    {
+                        record.Account.Change(
+                            new[]
+                            {
+                                record.Order
+                            });
+
+                        LogThreadSafe(
+                            "CHANGED "
+                            + record.Account.Name
+                            + " "
+                            + leaderOrder.Instrument.FullName);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogThreadSafe(
+                        "CHANGE ERROR "
+                        + record.Account.Name
+                        + ": "
+                        + ex.Message);
+                }
+            }
+        }
+
+        private void CancelFollowerOrders(
+            Order leaderOrder)
+        {
+            List<FollowerOrderRecord> records;
+
+            lock (syncLock)
+            {
+                if (
+                    !copiedOrders.TryGetValue(
+                        leaderOrder,
+                        out records))
+                {
+                    return;
+                }
+
+                records =
+                    records.ToList();
+            }
+
+            foreach (
+                FollowerOrderRecord record
+                in records)
+            {
+                if (
+                    record == null
+                    ||
+                    record.Order == null
+                    ||
+                    record.Account == null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    if (IsTerminal(record.Order.OrderState))
+                        continue;
+
+                    record.Account.Cancel(
+                        new[]
+                        {
+                            record.Order
+                        });
+
+                    LogThreadSafe(
+                        "CANCELLED follower order: "
+                        + record.Account.Name
+                        + " "
+                        + leaderOrder.Instrument.FullName);
+                }
+                catch (Exception ex)
+                {
+                    LogThreadSafe(
+                        "CANCEL ERROR "
+                        + record.Account.Name
+                        + ": "
+                        + ex.Message);
+                }
+            }
+        }
+
+        private string GetFollowerOco(
+            Account follower,
+            string leaderOco)
+        {
+            if (
+                follower == null
+                ||
+                string.IsNullOrEmpty(leaderOco))
+            {
+                return string.Empty;
+            }
+
+            string key =
+                follower.Name + "|" + leaderOco;
+
+            lock (syncLock)
+            {
+                string followerOco;
+
+                if (
+                    followerOcoMap.TryGetValue(
+                        key,
+                        out followerOco))
+                {
+                    return followerOco;
+                }
+
+                followerOco =
+                    "P4619_"
+                    + Guid.NewGuid().ToString("N");
+
+                followerOcoMap[key] =
+                    followerOco;
+
+                return followerOco;
+            }
+        }
+
+        private void FlattenButton_Click(
+            object sender,
+            RoutedEventArgs e)
+        {
+            KillEmAll();
+        }
+
+        private void KillEmAll()
+        {
+            try
+            {
+                SuspendCopierForKill();
+
+                lock (Account.All)
+                {
+                    killAccounts =
+                        Account.All
+                            .Where(a => a != null)
+                            .ToList();
+                }
+
+                Log(
+                    "KILL 'EM ALL ACTIVATED.");
+
+                foreach (
+                    Account account
+                    in killAccounts)
+                {
+                    try
+                    {
+                        List<Order> activeOrders;
+
+                        lock (account.Orders)
+                        {
+                            activeOrders =
+                                account.Orders
+                                    .Where(o =>
+                                        o != null
+                                        &&
+                                        !IsTerminal(o.OrderState))
+                                    .ToList();
+                        }
+
+                        if (activeOrders.Count > 0)
+                        {
+                            account.Cancel(activeOrders);
+
+                            Log(
+                                "CANCEL ALL SENT: "
+                                + account.Name
+                                + " ("
+                                + activeOrders.Count
+                                + " ORDERS)");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Log(
+                            "KILL CANCEL ERROR "
+                            + account.Name
+                            + ": "
+                            + ex.Message);
+                    }
+                }
+
+                if (killTimer != null)
+                {
+                    killTimer.Stop();
+
+                    killTimer.Tick -=
+                        KillTimer_Tick;
+                }
+
+                killTimer =
+                    new DispatcherTimer
+                    {
+                        Interval =
+                            TimeSpan.FromMilliseconds(50)
+                    };
+
+                killTimer.Tick +=
+                    KillTimer_Tick;
+
+                killTimer.Start();
+            }
+            catch (Exception ex)
+            {
+                Log(
+                    "KILL ERROR: "
+                    + ex.Message);
+            }
+        }
+
+        private void SuspendCopierForKill()
+        {
+            if (leaderAccount != null)
+            {
+                leaderAccount.OrderUpdate -=
+                    LeaderAccount_OrderUpdate;
+
+                leaderAccount.ExecutionUpdate -=
+                    LeaderAccount_ExecutionUpdate;
+            }
+
+            foreach (
+                FollowerSetting setting
+                in followerSettings.Values)
+            {
+                if (
+                    setting != null
+                    &&
+                    setting.Account != null)
+                {
+                    setting.Account.ExecutionUpdate -=
+                        FollowerAccount_ExecutionUpdate;
+                }
+            }
+
+            copierRunning =
+                false;
+
+            leaderComboBox.IsEnabled =
+                true;
+
+            startButton.IsEnabled =
+                true;
+
+            stopButton.IsEnabled =
+                false;
+
+            SetFollowerControlsEnabled(true);
+
+            if (statusText != null)
+            {
+                statusText.Text =
+                    "LOITERING...";
+            }
+        }
+        private void KillTimer_Tick(object sender, EventArgs e)
+        {
+            bool anyActiveOrders = false;
+
+            foreach (Account account in killAccounts.ToList())
+            {
+                try
+                {
+                    lock (account.Orders)
+                    {
+                        if (account.Orders.Any(o =>
+                            o != null &&
+                            !IsTerminal(o.OrderState)))
+                        {
+                            anyActiveOrders = true;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("KILL WAIT ERROR " +
+                        account.Name + ": " + ex.Message);
+
+                    anyActiveOrders = true;
+                }
+            }
+
+            if (anyActiveOrders)
+                return;
+
+            if (killTimer != null)
+            {
+                killTimer.Stop();
+                killTimer.Tick -= KillTimer_Tick;
+                killTimer = null;
+            }
+
+            foreach (Account account in killAccounts.ToList())
+            {
+                try
+                {
+                    Collection<Instrument> instruments =
+                        new Collection<Instrument>();
+
+                    lock (account.Positions)
+                    {
+                        foreach (Position position in account.Positions)
+                        {
+                            if (position == null ||
+                                position.Instrument == null ||
+                                position.MarketPosition == MarketPosition.Flat)
+                                continue;
+
+                            if (!instruments.Contains(position.Instrument))
+                            {
+                                instruments.Add(position.Instrument);
+                            }
+                        }
+                    }
+
+                    if (instruments.Count > 0)
+                    {
+                        account.Flatten(instruments);
+
+                        Log("FLATTEN ALL SENT: " + account.Name);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("KILL FLATTEN ERROR " +
+                        account.Name + ": " + ex.Message);
+                }
+            }
+
+            Log("KILL 'EM ALL COMMANDS SENT. " +
+                "COPIER REMAINS LOITERING.");
+        }
+
+        private List<FollowerSetting> GetEnabledFollowers()
+        {
+            return followerSettings.Values
+                .Where(f =>
+                    f != null &&
+                    f.CopyCheckBox != null &&
+                    f.CopyCheckBox.IsChecked == true)
+                .ToList();
+        }
+
+        private List<FollowerSetting> GetEnabledFollowersThreadSafe()
+        {
+            List<FollowerSetting> result = null;
+
+            if (Dispatcher.CheckAccess())
+            {
+                result = GetEnabledFollowers();
+            }
+            else
+            {
+                Dispatcher.Invoke(new Action(() =>
+                {
+                    result = GetEnabledFollowers();
+                }));
+            }
+
+            return result ?? new List<FollowerSetting>();
+        }
+
+        private int GetMultiplier(FollowerSetting setting)
+        {
+            int result = 1;
+
+            if (setting == null ||
+                setting.MultiplierTextBox == null)
+                return result;
+
+            string text = null;
+
+            if (Dispatcher.CheckAccess())
+            {
+                text = setting.MultiplierTextBox.Text;
+            }
+            else
+            {
+                Dispatcher.Invoke(new Action(() =>
+                {
+                    text = setting.MultiplierTextBox.Text;
+                }));
+            }
+
+            if (!int.TryParse(text, out result) ||
+                result < 1)
+            {
+                result = 1;
+            }
+
+            return result;
+        }
+
+        private void SetFollowerControlsEnabled(bool enabled)
+        {
+            foreach (FollowerSetting setting in followerSettings.Values)
+            {
+                if (setting == null)
+                    continue;
+
+                if (setting.CopyCheckBox != null)
+                    setting.CopyCheckBox.IsEnabled = enabled;
+
+                if (setting.MultiplierTextBox != null)
+                    setting.MultiplierTextBox.IsEnabled = enabled;
+            }
+        }
+
+        private bool IsTerminal(OrderState state)
+        {
+            return state == OrderState.Cancelled ||
+                   state == OrderState.Filled ||
+                   state == OrderState.Rejected;
+        }
+
+        private Border AccentBorder()
+        {
+            return new Border
+            {
+                BorderBrush = accentBrush,
+                BorderThickness = new Thickness(2),
+                Background = panelBrush
+            };
+        }
+
+        private TextBlock Label(
+            string text,
+            double size,
+            FontWeight weight)
+        {
+            return new TextBlock
+            {
+                Text = text,
+                Foreground = accentBrush,
+                FontSize = size,
+                FontWeight = weight,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+        }
+
+        private Button AccentButton(string text)
+        {
+            return new Button
+            {
+                Content = text,
+                Height = 34,
+                Margin = new Thickness(2),
+                Foreground = accentBrush,
+                Background = rowBrush,
+                BorderBrush = accentBrush,
+                BorderThickness = new Thickness(2),
+                FontWeight = FontWeights.Bold,
+                FontSize = 14
+            };
+        }
+
+        private void LogThreadSafe(string message)
+        {
+            if (Dispatcher.CheckAccess())
+            {
+                Log(message);
+            }
+            else
+            {
+                Dispatcher.InvokeAsync(new Action(() =>
+                {
+                    Log(message);
+                }));
+            }
+        }
+
+        private void Log(string message)
+        {
+            if (logTextBox == null)
+                return;
+
+            string line =
+                DateTime.Now.ToString("HH:mm:ss.fff") +
+                "  " + message;
+
+            if (string.IsNullOrEmpty(logTextBox.Text))
+            {
+                logTextBox.Text = line;
+            }
+            else
+            {
+                logTextBox.AppendText(
+                    Environment.NewLine + line);
+            }
+
+            logTextBox.ScrollToEnd();
+        }
+    }
+}
